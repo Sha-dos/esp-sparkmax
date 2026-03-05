@@ -27,6 +27,7 @@
 #include "driver/gpio.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/queue.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -91,19 +92,30 @@ typedef struct {
     bool                started;
     twai_node_handle_t  node;
     TaskHandle_t        hb_task;
+    TaskHandle_t        decode_task;
+    QueueHandle_t       rx_queue;
     sparkmax_rx_cb_t    rx_cb;
     void               *rx_user_ctx;
 
     /*
      * The TWAI driver holds a raw twai_frame_t* until the TX-done ISR fires,
      * so both the frame struct and its data buffer must be long-lived.
-     * Separate slots for heartbeat vs. setpoint so they never collide.
+     * Separate slots for heartbeat, setpoint, and status config so they never collide.
      */
     uint8_t      tx_buf_hb[8];
     twai_frame_t tx_frame_hb;
 
     uint8_t      tx_buf_cmd[8];
     twai_frame_t tx_frame_cmd;
+
+    uint8_t      tx_buf_status[8];
+    twai_frame_t tx_frame_status;
+
+    volatile float position_rotations;   /* Status 2: motor position (rotations) */
+    volatile float velocity_rpm;         /* Status 1: motor velocity (RPM)        */
+    volatile float bus_voltage;          /* Status 1: bus voltage (V)             */
+    volatile float output_current;       /* Status 1: output current (A)          */
+    volatile float applied_output;       /* Status 0: applied output [-1, 1]      */
 } sparkmax_t;
 
 // ---------------------------------------------------------------------------
@@ -148,6 +160,18 @@ void sparkmax_set_position(sparkmax_t *motor, float rotations);
 void sparkmax_set_status_period(sparkmax_t *motor,
                                 uint32_t frame_base,
                                 uint16_t period_ms);
+
+/**
+ * Read the latest decoded periodic status values.
+ * These are updated automatically by the RX ISR whenever the SPARK MAX
+ * broadcasts its periodic frames.  Enable Status 2 first with:
+ *   sparkmax_set_status_period(motor, SPARKMAX_STATUS_2_BASE, 20);
+ */
+float sparkmax_get_position(sparkmax_t *motor);   /* rotations          */
+float sparkmax_get_velocity(sparkmax_t *motor);   /* RPM                */
+float sparkmax_get_voltage(sparkmax_t *motor);    /* bus voltage (V)    */
+float sparkmax_get_current(sparkmax_t *motor);    /* output current (A) */
+float sparkmax_get_output(sparkmax_t *motor);     /* applied output [-1,1] */
 
 #ifdef __cplusplus
 }

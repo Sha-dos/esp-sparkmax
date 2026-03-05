@@ -1,20 +1,21 @@
 #include "esp-sparkmax.h"
 #include <string.h>
 #include "esp_log.h"
+#include "freertos/queue.h"
 
 static const char *TAG = "sparkmax";
+
+/* Raw frame passed from RX ISR to decode task — no floats in ISR */
+typedef struct {
+    uint32_t arb_id;
+    uint8_t  data[8];
+    uint8_t  len;
+} raw_frame_t;
 
 // ---------------------------------------------------------------------------
 // Internal helpers
 // ---------------------------------------------------------------------------
 
-/*
- * Populate a long-lived twai_frame_t and queue it for transmission.
- *
- * Both `frame` and `buf` must be members of sparkmax_t — the TWAI driver
- * stores a raw pointer to the frame and the ISR dereferences it after this
- * function returns.  Stack-allocated frames will be freed before that happens.
- */
 static void send_frame(sparkmax_t *motor,
                        twai_frame_t *frame, uint8_t *buf,
                        uint32_t arb_id, const uint8_t *data, uint8_t len)
@@ -34,14 +35,12 @@ static void send_frame(sparkmax_t *motor,
     frame->buffer     = buf;
     frame->buffer_len = len;
 
-    /* API takes milliseconds directly, not FreeRTOS ticks */
     esp_err_t err = twai_node_transmit(motor->node, frame, 5);
     if (err != ESP_OK) {
         ESP_LOGW(TAG, "TX failed arb_id=0x%08X err=%d", (unsigned)arb_id, err);
     }
 }
 
-/* Convenience: pack a float setpoint into an 8-byte frame and send it. */
 static void send_setpoint(sparkmax_t *motor, uint32_t arb_id, float value)
 {
     uint8_t data[8] = {0};
@@ -69,7 +68,60 @@ static void heartbeat_task(void *arg)
 }
 
 // ---------------------------------------------------------------------------
-// RX ISR
+// Decode periodic status frames  (runs in task context — FPU is safe here)
+// ---------------------------------------------------------------------------
+
+static void decode_status(sparkmax_t *motor, uint32_t arb_id, const uint8_t *data, uint8_t len) {
+    uint32_t base = arb_id - motor->device_id;   /* strip device ID */
+
+    if (base == SPARKMAX_STATUS_0_BASE && len >= 2) {
+        /* Applied output: signed 16-bit, scale 1/32768 */
+        int16_t raw;
+        memcpy(&raw, data, sizeof(raw));
+        motor->applied_output = (float)raw / 32768.0f;
+
+    } else if (base == SPARKMAX_STATUS_1_BASE && len >= 8) {
+        /* Velocity: IEEE float in bytes 0-3 */
+        float vel;
+        memcpy(&vel, data, sizeof(vel));
+        motor->velocity_rpm = vel;
+
+        /* Voltage: bytes 5-6 packed as 9q7 */
+        uint16_t v_raw = (uint16_t)data[5] | (((uint16_t)data[6] & 0xF0) << 4);
+        motor->bus_voltage = (float)v_raw / 128.0f;
+
+        /* Current: lower nibble of byte 6 + byte 7, 12-bit, scale 1/32 */
+        uint16_t i_raw = ((uint16_t)data[6] & 0x0F) | ((uint16_t)data[7] << 4);
+        motor->output_current = (float)i_raw / 32.0f;
+
+    } else if (base == SPARKMAX_STATUS_2_BASE && len >= 4) {
+        /* Position: IEEE float in bytes 0-3 (rotations) */
+        float pos;
+        memcpy(&pos, data, sizeof(pos));
+        motor->position_rotations = pos;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Decode task — dequeues raw frames and decodes them (FPU safe)
+// ---------------------------------------------------------------------------
+
+static void decode_task(void *arg)
+{
+    sparkmax_t *motor = (sparkmax_t *)arg;
+    raw_frame_t f;
+    while (1) {
+        if (xQueueReceive(motor->rx_queue, &f, portMAX_DELAY) == pdTRUE) {
+            decode_status(motor, f.arb_id, f.data, f.len);
+            if (motor->rx_cb) {
+                motor->rx_cb(f.arb_id, f.data, f.len, motor->rx_user_ctx);
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// RX ISR  — only copies bytes into the queue, no float math
 // ---------------------------------------------------------------------------
 
 static bool rx_isr(twai_node_handle_t handle,
@@ -77,12 +129,16 @@ static bool rx_isr(twai_node_handle_t handle,
                    void *user_ctx)
 {
     sparkmax_t *motor = (sparkmax_t *)user_ctx;
-    uint8_t buf[8] = {0};
-    twai_frame_t frame = { .buffer = buf, .buffer_len = sizeof(buf) };
+    raw_frame_t f;
+    memset(&f, 0, sizeof(f));
+    twai_frame_t frame = { .buffer = f.data, .buffer_len = sizeof(f.data) };
 
-    if (twai_node_receive_from_isr(handle, &frame) == ESP_OK && motor->rx_cb) {
-        motor->rx_cb(frame.header.id, buf, (uint8_t)frame.buffer_len,
-                     motor->rx_user_ctx);
+    if (twai_node_receive_from_isr(handle, &frame) == ESP_OK) {
+        f.arb_id = frame.header.id;
+        f.len    = (uint8_t)frame.header.dlc;
+        BaseType_t woken = pdFALSE;
+        xQueueSendFromISR(motor->rx_queue, &f, &woken);
+        return woken == pdTRUE;
     }
     return false;
 }
@@ -107,6 +163,12 @@ bool sparkmax_begin(sparkmax_t *motor,
     motor->rx_cb       = rx_cb;
     motor->rx_user_ctx = user_ctx;
 
+    motor->rx_queue = xQueueCreate(16, sizeof(raw_frame_t));
+    if (!motor->rx_queue) {
+        ESP_LOGE(TAG, "Failed to create rx queue");
+        return false;
+    }
+
     twai_onchip_node_config_t node_cfg = {
         .io_cfg = {
             .tx                = motor->config.tx_pin,
@@ -116,29 +178,26 @@ bool sparkmax_begin(sparkmax_t *motor,
         },
         .bit_timing     = { .bitrate = 1000000 },  /* 1 Mbit/s */
         .tx_queue_depth = 16,
-        .flags = {
-            /* STM bit: transmit succeeds without an external ACK.
-               Without this the ESP32 bus-errors when no other node
-               is present to acknowledge frames. */
-            .enable_self_test = 1,
-        },
+        .flags = { 0 },
     };
 
     esp_err_t err = twai_new_node_onchip(&node_cfg, &motor->node);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "twai_new_node_onchip failed: %d", err);
+        vQueueDelete(motor->rx_queue);
+        motor->rx_queue = NULL;
         return false;
     }
 
-    if (rx_cb) {
-        twai_event_callbacks_t cbs = { .on_rx_done = rx_isr };
-        err = twai_node_register_event_callbacks(motor->node, &cbs, motor);
-        if (err != ESP_OK) {
-            ESP_LOGE(TAG, "register_event_callbacks failed: %d", err);
-            twai_node_delete(motor->node);
-            motor->node = NULL;
-            return false;
-        }
+    twai_event_callbacks_t cbs = { .on_rx_done = rx_isr };
+    err = twai_node_register_event_callbacks(motor->node, &cbs, motor);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "register_event_callbacks failed: %d", err);
+        twai_node_delete(motor->node);
+        motor->node = NULL;
+        vQueueDelete(motor->rx_queue);
+        motor->rx_queue = NULL;
+        return false;
     }
 
     err = twai_node_enable(motor->node);
@@ -146,6 +205,8 @@ bool sparkmax_begin(sparkmax_t *motor,
         ESP_LOGE(TAG, "twai_node_enable failed: %d", err);
         twai_node_delete(motor->node);
         motor->node = NULL;
+        vQueueDelete(motor->rx_queue);
+        motor->rx_queue = NULL;
         return false;
     }
 
@@ -156,11 +217,27 @@ bool sparkmax_begin(sparkmax_t *motor,
         twai_node_disable(motor->node);
         twai_node_delete(motor->node);
         motor->node = NULL;
+        vQueueDelete(motor->rx_queue);
+        motor->rx_queue = NULL;
+        return false;
+    }
+
+    ret = xTaskCreate(decode_task, "sparkmax_rx", 2048, motor,
+                      configMAX_PRIORITIES - 3, &motor->decode_task);
+    if (ret != pdPASS) {
+        ESP_LOGE(TAG, "Failed to create decode task");
+        vTaskDelete(motor->hb_task);
+        motor->hb_task = NULL;
+        twai_node_disable(motor->node);
+        twai_node_delete(motor->node);
+        motor->node = NULL;
+        vQueueDelete(motor->rx_queue);
+        motor->rx_queue = NULL;
         return false;
     }
 
     motor->started = true;
-    ESP_LOGI(TAG, "SPARK MAX started  device_id=%d", motor->device_id);
+    ESP_LOGI(TAG, "SPARK MAX started (device_id=%d)", motor->device_id);
     ESP_LOGI(TAG, "  heartbeat  0x%08X (broadcast)", (unsigned)SPARKMAX_HEARTBEAT_ARBID);
     ESP_LOGI(TAG, "  duty cycle 0x%08X", (unsigned)SPARKMAX_ARBID(SPARKMAX_DUTY_CYCLE_BASE, motor->device_id));
     ESP_LOGI(TAG, "  velocity   0x%08X", (unsigned)SPARKMAX_ARBID(SPARKMAX_VELOCITY_BASE,   motor->device_id));
@@ -172,14 +249,26 @@ void sparkmax_end(sparkmax_t *motor)
 {
     if (!motor->started) return;
 
-    vTaskDelete(motor->hb_task);
-    motor->hb_task = NULL;
+    if (motor->hb_task) {
+        vTaskDelete(motor->hb_task);
+        motor->hb_task = NULL;
+    }
+    if (motor->decode_task) {
+        vTaskDelete(motor->decode_task);
+        motor->decode_task = NULL;
+    }
 
     sparkmax_set_duty_cycle(motor, 0.0f);
 
     twai_node_disable(motor->node);
     twai_node_delete(motor->node);
     motor->node    = NULL;
+
+    if (motor->rx_queue) {
+        vQueueDelete(motor->rx_queue);
+        motor->rx_queue = NULL;
+    }
+
     motor->started = false;
 }
 
@@ -204,6 +293,17 @@ void sparkmax_set_status_period(sparkmax_t *motor,
                                 uint32_t frame_base, uint16_t period_ms)
 {
     uint8_t data[2] = { (uint8_t)(period_ms & 0xFF), (uint8_t)(period_ms >> 8) };
-    send_frame(motor, &motor->tx_frame_cmd, motor->tx_buf_cmd,
+    send_frame(motor, &motor->tx_frame_status, motor->tx_buf_status,
                SPARKMAX_ARBID(frame_base, motor->device_id), data, sizeof(data));
 }
+
+// ---------------------------------------------------------------------------
+// Status getters
+// ---------------------------------------------------------------------------
+
+float sparkmax_get_position(sparkmax_t *motor)  { return motor->position_rotations; }
+float sparkmax_get_velocity(sparkmax_t *motor)  { return motor->velocity_rpm; }
+float sparkmax_get_voltage(sparkmax_t *motor)   { return motor->bus_voltage; }
+float sparkmax_get_current(sparkmax_t *motor)   { return motor->output_current; }
+float sparkmax_get_output(sparkmax_t *motor)    { return motor->applied_output; }
+
