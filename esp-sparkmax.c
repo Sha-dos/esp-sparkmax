@@ -81,16 +81,15 @@ static void decode_status(sparkmax_t *motor, uint32_t arb_id, const uint8_t *dat
         motor->applied_output = (float)raw / 32768.0f;
 
     } else if (base == SPARKMAX_STATUS_1_BASE && len >= 8) {
-        /* Velocity: IEEE float in bytes 0-3 */
         float vel;
         memcpy(&vel, data, sizeof(vel));
         motor->velocity_rpm = vel;
 
-        /* Voltage: bytes 5-6 packed as 9q7 */
+        motor->temperature_c = (float)data[4];
+
         uint16_t v_raw = (uint16_t)data[5] | (((uint16_t)data[6] & 0xF0) << 4);
         motor->bus_voltage = (float)v_raw / 128.0f;
 
-        /* Current: lower nibble of byte 6 + byte 7, 12-bit, scale 1/32 */
         uint16_t i_raw = ((uint16_t)data[6] & 0x0F) | ((uint16_t)data[7] << 4);
         motor->output_current = (float)i_raw / 32.0f;
 
@@ -301,9 +300,10 @@ void sparkmax_set_status_period(sparkmax_t *motor,
 // Status getters
 // ---------------------------------------------------------------------------
 
-float sparkmax_get_position(sparkmax_t *motor)  { return motor->position_rotations; }
-float sparkmax_get_velocity(sparkmax_t *motor)  { return motor->velocity_rpm; }
-float sparkmax_get_voltage(sparkmax_t *motor)   { return motor->bus_voltage; }
-float sparkmax_get_current(sparkmax_t *motor)   { return motor->output_current; }
-float sparkmax_get_output(sparkmax_t *motor)    { return motor->applied_output; }
+float sparkmax_get_position(sparkmax_t *motor)   { return motor->position_rotations; }
+float sparkmax_get_velocity(sparkmax_t *motor)   { return motor->velocity_rpm; }
+float sparkmax_get_voltage(sparkmax_t *motor)    { return motor->bus_voltage; }
+float sparkmax_get_current(sparkmax_t *motor)    { return motor->output_current; }
+float sparkmax_get_output(sparkmax_t *motor)     { return motor->applied_output; }
+float sparkmax_get_temperature(sparkmax_t *motor) { return motor->temperature_c; }
 

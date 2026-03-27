@@ -116,6 +116,7 @@ typedef struct {
     volatile float bus_voltage;          /* Status 1: bus voltage (V)             */
     volatile float output_current;       /* Status 1: output current (A)          */
     volatile float applied_output;       /* Status 0: applied output [-1, 1]      */
+    volatile float temperature_c;        /* Status 1: motor temperature (°C) */
 } sparkmax_t;
 
 // ---------------------------------------------------------------------------
@@ -167,11 +168,12 @@ void sparkmax_set_status_period(sparkmax_t *motor,
  * broadcasts its periodic frames.  Enable Status 2 first with:
  *   sparkmax_set_status_period(motor, SPARKMAX_STATUS_2_BASE, 20);
  */
-float sparkmax_get_position(sparkmax_t *motor);   /* rotations          */
-float sparkmax_get_velocity(sparkmax_t *motor);   /* RPM                */
-float sparkmax_get_voltage(sparkmax_t *motor);    /* bus voltage (V)    */
-float sparkmax_get_current(sparkmax_t *motor);    /* output current (A) */
-float sparkmax_get_output(sparkmax_t *motor);     /* applied output [-1,1] */
+float sparkmax_get_position(sparkmax_t *motor);     /* rotations          */
+float sparkmax_get_velocity(sparkmax_t *motor);     /* RPM                */
+float sparkmax_get_voltage(sparkmax_t *motor);      /* bus voltage (V)    */
+float sparkmax_get_current(sparkmax_t *motor);      /* output current (A) */
+float sparkmax_get_output(sparkmax_t *motor);       /* applied output [-1,1] */
+float sparkmax_get_temperature(sparkmax_t *motor);  /* motor temp (°C) */
 
 #ifdef __cplusplus
 }
