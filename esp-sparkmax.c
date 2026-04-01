@@ -5,7 +5,6 @@
 
 static const char *TAG = "sparkmax";
 
-/* Raw frame passed from RX ISR to decode task — no floats in ISR */
 typedef struct {
     uint32_t arb_id;
     uint8_t  data[8];
@@ -16,26 +15,11 @@ typedef struct {
 // Internal helpers
 // ---------------------------------------------------------------------------
 
-static void send_frame(sparkmax_t *motor,
-                       twai_frame_t *frame, uint8_t *buf,
-                       uint32_t arb_id, const uint8_t *data, uint8_t len)
+static void send_raw(sparkmax_t *motor,
+                     uint32_t arb_id, const uint8_t *data, uint8_t len)
 {
-    if (!motor->node) return;
     if (len > 8) len = 8;
-
-    memcpy(buf, data, len);
-
-    frame->header.id  = arb_id;
-    frame->header.ide = true;
-    frame->header.rtr = false;
-    frame->header.dlc = len;
-    frame->header.fdf = false;
-    frame->header.brs = false;
-    frame->header.esi = false;
-    frame->buffer     = buf;
-    frame->buffer_len = len;
-
-    esp_err_t err = twai_node_transmit(motor->node, frame, 5);
+    esp_err_t err = motor->config.tx_fn(arb_id, data, len, motor->config.tx_ctx);
     if (err != ESP_OK) {
         ESP_LOGW(TAG, "TX failed arb_id=0x%08X err=%d", (unsigned)arb_id, err);
     }
@@ -45,12 +29,11 @@ static void send_setpoint(sparkmax_t *motor, uint32_t arb_id, float value)
 {
     uint8_t data[8] = {0};
     memcpy(data, &value, sizeof(float));
-    send_frame(motor, &motor->tx_frame_cmd, motor->tx_buf_cmd,
-               arb_id, data, sizeof(data));
+    send_raw(motor, arb_id, data, sizeof(data));
 }
 
 // ---------------------------------------------------------------------------
-// Heartbeat task — 8×0xFF broadcast every 10 ms
+// Heartbeat task — 8×0xFF every 10 ms
 // ---------------------------------------------------------------------------
 
 static void heartbeat_task(void *arg)
@@ -59,23 +42,22 @@ static void heartbeat_task(void *arg)
     static const uint8_t hb_data[8] = {
         0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF
     };
-
     while (1) {
-        send_frame(motor, &motor->tx_frame_hb, motor->tx_buf_hb,
-                   SPARKMAX_HEARTBEAT_ARBID, hb_data, sizeof(hb_data));
+        send_raw(motor, SPARKMAX_HEARTBEAT_ARBID, hb_data, sizeof(hb_data));
         vTaskDelay(pdMS_TO_TICKS(10));
     }
 }
 
 // ---------------------------------------------------------------------------
-// Decode periodic status frames  (runs in task context — FPU is safe here)
+// Decode status frames (task context — FPU safe)
 // ---------------------------------------------------------------------------
 
-static void decode_status(sparkmax_t *motor, uint32_t arb_id, const uint8_t *data, uint8_t len) {
-    uint32_t base = arb_id - motor->device_id;   /* strip device ID */
+static void decode_status(sparkmax_t *motor,
+                           uint32_t arb_id, const uint8_t *data, uint8_t len)
+{
+    uint32_t base = arb_id - motor->device_id;
 
     if (base == SPARKMAX_STATUS_0_BASE && len >= 2) {
-        /* Applied output: signed 16-bit, scale 1/32768 */
         int16_t raw;
         memcpy(&raw, data, sizeof(raw));
         motor->applied_output = (float)raw / 32768.0f;
@@ -94,7 +76,6 @@ static void decode_status(sparkmax_t *motor, uint32_t arb_id, const uint8_t *dat
         motor->output_current = (float)i_raw / 32.0f;
 
     } else if (base == SPARKMAX_STATUS_2_BASE && len >= 4) {
-        /* Position: IEEE float in bytes 0-3 (rotations) */
         float pos;
         memcpy(&pos, data, sizeof(pos));
         motor->position_rotations = pos;
@@ -102,7 +83,7 @@ static void decode_status(sparkmax_t *motor, uint32_t arb_id, const uint8_t *dat
 }
 
 // ---------------------------------------------------------------------------
-// Decode task — dequeues raw frames and decodes them (FPU safe)
+// Decode task
 // ---------------------------------------------------------------------------
 
 static void decode_task(void *arg)
@@ -117,29 +98,6 @@ static void decode_task(void *arg)
             }
         }
     }
-}
-
-// ---------------------------------------------------------------------------
-// RX ISR  — only copies bytes into the queue, no float math
-// ---------------------------------------------------------------------------
-
-static bool rx_isr(twai_node_handle_t handle,
-                   const twai_rx_done_event_data_t *edata,
-                   void *user_ctx)
-{
-    sparkmax_t *motor = (sparkmax_t *)user_ctx;
-    raw_frame_t f;
-    memset(&f, 0, sizeof(f));
-    twai_frame_t frame = { .buffer = f.data, .buffer_len = sizeof(f.data) };
-
-    if (twai_node_receive_from_isr(handle, &frame) == ESP_OK) {
-        f.arb_id = frame.header.id;
-        f.len    = (uint8_t)frame.header.dlc;
-        BaseType_t woken = pdFALSE;
-        xQueueSendFromISR(motor->rx_queue, &f, &woken);
-        return woken == pdTRUE;
-    }
-    return false;
 }
 
 // ---------------------------------------------------------------------------
@@ -159,6 +117,11 @@ bool sparkmax_begin(sparkmax_t *motor,
                     sparkmax_rx_cb_t rx_cb,
                     void *user_ctx)
 {
+    if (!motor->config.tx_fn) {
+        ESP_LOGE(TAG, "tx_fn is NULL — provide a transmit function in sparkmax_config_t");
+        return false;
+    }
+
     motor->rx_cb       = rx_cb;
     motor->rx_user_ctx = user_ctx;
 
@@ -168,54 +131,10 @@ bool sparkmax_begin(sparkmax_t *motor,
         return false;
     }
 
-    twai_onchip_node_config_t node_cfg = {
-        .io_cfg = {
-            .tx                = motor->config.tx_pin,
-            .rx                = motor->config.rx_pin,
-            .quanta_clk_out    = -1,
-            .bus_off_indicator = -1,
-        },
-        .bit_timing     = { .bitrate = 1000000 },  /* 1 Mbit/s */
-        .tx_queue_depth = 16,
-        .flags = { 0 },
-    };
-
-    esp_err_t err = twai_new_node_onchip(&node_cfg, &motor->node);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "twai_new_node_onchip failed: %d", err);
-        vQueueDelete(motor->rx_queue);
-        motor->rx_queue = NULL;
-        return false;
-    }
-
-    twai_event_callbacks_t cbs = { .on_rx_done = rx_isr };
-    err = twai_node_register_event_callbacks(motor->node, &cbs, motor);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "register_event_callbacks failed: %d", err);
-        twai_node_delete(motor->node);
-        motor->node = NULL;
-        vQueueDelete(motor->rx_queue);
-        motor->rx_queue = NULL;
-        return false;
-    }
-
-    err = twai_node_enable(motor->node);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "twai_node_enable failed: %d", err);
-        twai_node_delete(motor->node);
-        motor->node = NULL;
-        vQueueDelete(motor->rx_queue);
-        motor->rx_queue = NULL;
-        return false;
-    }
-
     BaseType_t ret = xTaskCreate(heartbeat_task, "sparkmax_hb", 2048, motor,
                                  configMAX_PRIORITIES - 2, &motor->hb_task);
     if (ret != pdPASS) {
         ESP_LOGE(TAG, "Failed to create heartbeat task");
-        twai_node_disable(motor->node);
-        twai_node_delete(motor->node);
-        motor->node = NULL;
         vQueueDelete(motor->rx_queue);
         motor->rx_queue = NULL;
         return false;
@@ -227,9 +146,6 @@ bool sparkmax_begin(sparkmax_t *motor,
         ESP_LOGE(TAG, "Failed to create decode task");
         vTaskDelete(motor->hb_task);
         motor->hb_task = NULL;
-        twai_node_disable(motor->node);
-        twai_node_delete(motor->node);
-        motor->node = NULL;
         vQueueDelete(motor->rx_queue);
         motor->rx_queue = NULL;
         return false;
@@ -237,10 +153,6 @@ bool sparkmax_begin(sparkmax_t *motor,
 
     motor->started = true;
     ESP_LOGI(TAG, "SPARK MAX started (device_id=%d)", motor->device_id);
-    ESP_LOGI(TAG, "  heartbeat  0x%08X (broadcast)", (unsigned)SPARKMAX_HEARTBEAT_ARBID);
-    ESP_LOGI(TAG, "  duty cycle 0x%08X", (unsigned)SPARKMAX_ARBID(SPARKMAX_DUTY_CYCLE_BASE, motor->device_id));
-    ESP_LOGI(TAG, "  velocity   0x%08X", (unsigned)SPARKMAX_ARBID(SPARKMAX_VELOCITY_BASE,   motor->device_id));
-    ESP_LOGI(TAG, "  position   0x%08X", (unsigned)SPARKMAX_ARBID(SPARKMAX_POSITION_BASE,   motor->device_id));
     return true;
 }
 
@@ -259,16 +171,30 @@ void sparkmax_end(sparkmax_t *motor)
 
     sparkmax_set_duty_cycle(motor, 0.0f);
 
-    twai_node_disable(motor->node);
-    twai_node_delete(motor->node);
-    motor->node    = NULL;
-
     if (motor->rx_queue) {
         vQueueDelete(motor->rx_queue);
         motor->rx_queue = NULL;
     }
 
     motor->started = false;
+}
+
+void sparkmax_feed_rx(sparkmax_t *motor,
+                      uint32_t arb_id,
+                      const uint8_t *data,
+                      uint8_t len)
+{
+    if (!motor->rx_queue) return;
+    if (len > 8) len = 8;
+
+    raw_frame_t f;
+    f.arb_id = arb_id;
+    f.len    = len;
+    memcpy(f.data, data, len);
+
+    BaseType_t woken = pdFALSE;
+    xQueueSendFromISR(motor->rx_queue, &f, &woken);
+    portYIELD_FROM_ISR(woken);
 }
 
 void sparkmax_set_duty_cycle(sparkmax_t *motor, float duty)
@@ -292,18 +218,13 @@ void sparkmax_set_status_period(sparkmax_t *motor,
                                 uint32_t frame_base, uint16_t period_ms)
 {
     uint8_t data[2] = { (uint8_t)(period_ms & 0xFF), (uint8_t)(period_ms >> 8) };
-    send_frame(motor, &motor->tx_frame_status, motor->tx_buf_status,
-               SPARKMAX_ARBID(frame_base, motor->device_id), data, sizeof(data));
+    send_raw(motor, SPARKMAX_ARBID(frame_base, motor->device_id), data, sizeof(data));
 }
 
-// ---------------------------------------------------------------------------
-// Status getters
-// ---------------------------------------------------------------------------
-
-float sparkmax_get_position(sparkmax_t *motor)   { return motor->position_rotations; }
-float sparkmax_get_velocity(sparkmax_t *motor)   { return motor->velocity_rpm; }
-float sparkmax_get_voltage(sparkmax_t *motor)    { return motor->bus_voltage; }
-float sparkmax_get_current(sparkmax_t *motor)    { return motor->output_current; }
-float sparkmax_get_output(sparkmax_t *motor)     { return motor->applied_output; }
+float sparkmax_get_position(sparkmax_t *motor)    { return motor->position_rotations; }
+float sparkmax_get_velocity(sparkmax_t *motor)    { return motor->velocity_rpm; }
+float sparkmax_get_voltage(sparkmax_t *motor)     { return motor->bus_voltage; }
+float sparkmax_get_current(sparkmax_t *motor)     { return motor->output_current; }
+float sparkmax_get_output(sparkmax_t *motor)      { return motor->applied_output; }
 float sparkmax_get_temperature(sparkmax_t *motor) { return motor->temperature_c; }
 
